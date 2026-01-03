@@ -6,6 +6,13 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import anthropic
 import base64
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import cm
+from reportlab.lib.enums import TA_CENTER, TA_RIGHT
+from io import BytesIO
 
 # Configuration du logging
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -41,6 +48,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📸 Envoyez-moi une photo de votre ticket de caisse\n"
         "📊 Utilisez /total pour voir vos totaux mensuels\n"
         "📋 Utilisez /liste pour voir tous vos tickets\n"
+        "📄 Utilisez /pdf [année] pour générer un PDF (ex: /pdf 2025)\n"
         "🗑️ Utilisez /reset pour effacer toutes les données\n\n"
         "Je vais analyser automatiquement chaque ticket !"
     )
@@ -137,7 +145,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 🧾 TVA: {receipt_data['vat']:.2f} €
 💰 Total: {receipt_data['total_price']:.2f} €
 
-Utilisez /total pour voir vos totaux mensuels."""
+Utilisez /total pour voir vos totaux mensuels.
+Utilisez /pdf pour générer un rapport PDF."""
         
         await update.message.reply_text(response)
         
@@ -226,6 +235,222 @@ async def show_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(response)
 
+def generate_pdf(receipts, year=None):
+    """Génère un PDF avec tous les tickets"""
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4, topMargin=2*cm, bottomMargin=2*cm)
+    elements = []
+    styles = getSampleStyleSheet()
+    
+    # Style personnalisé pour le titre
+    title_style = ParagraphStyle(
+        'CustomTitle',
+        parent=styles['Heading1'],
+        fontSize=24,
+        textColor=colors.HexColor('#1e40af'),
+        spaceAfter=30,
+        alignment=TA_CENTER,
+        fontName='Helvetica-Bold'
+    )
+    
+    # Style pour les sous-titres
+    subtitle_style = ParagraphStyle(
+        'CustomSubtitle',
+        parent=styles['Heading2'],
+        fontSize=16,
+        textColor=colors.HexColor('#1e40af'),
+        spaceAfter=12,
+        spaceBefore=20,
+        fontName='Helvetica-Bold'
+    )
+    
+    # Filtrer par année si spécifié
+    if year:
+        receipts = [r for r in receipts if datetime.strptime(r['date'], '%Y-%m-%d').year == year]
+        title_text = f"Rapport Carburant {year}"
+    else:
+        title_text = "Rapport Carburant - Tous les tickets"
+    
+    if not receipts:
+        # Titre
+        elements.append(Paragraph(title_text, title_style))
+        elements.append(Spacer(1, 20))
+        elements.append(Paragraph("Aucun ticket trouvé pour cette période.", styles['Normal']))
+        doc.build(elements)
+        buffer.seek(0)
+        return buffer
+    
+    # Titre
+    elements.append(Paragraph(title_text, title_style))
+    elements.append(Paragraph(f"Généré le {datetime.now().strftime('%d/%m/%Y à %H:%M')}", styles['Normal']))
+    elements.append(Spacer(1, 30))
+    
+    # Grouper par mois
+    monthly_data = {}
+    for receipt in receipts:
+        date_obj = datetime.strptime(receipt['date'], '%Y-%m-%d')
+        month_key = date_obj.strftime('%Y-%m')
+        month_name = date_obj.strftime('%B %Y').title()
+        
+        if month_key not in monthly_data:
+            monthly_data[month_key] = {
+                'name': month_name,
+                'receipts': [],
+                'totals': {'liters': 0, 'vat': 0, 'total_price': 0}
+            }
+        
+        monthly_data[month_key]['receipts'].append(receipt)
+        monthly_data[month_key]['totals']['liters'] += receipt['liters']
+        monthly_data[month_key]['totals']['vat'] += receipt['vat']
+        monthly_data[month_key]['totals']['total_price'] += receipt['total_price']
+    
+    # Créer un tableau pour chaque mois
+    for month_key in sorted(monthly_data.keys(), reverse=True):
+        data = monthly_data[month_key]
+        
+        # Sous-titre du mois
+        elements.append(Paragraph(f"📅 {data['name']}", subtitle_style))
+        elements.append(Spacer(1, 10))
+        
+        # Données du tableau
+        table_data = [['Date', 'Carburant', 'Litres', 'Prix/L', 'TVA', 'Total']]
+        
+        for receipt in sorted(data['receipts'], key=lambda x: x['date']):
+            date_obj = datetime.strptime(receipt['date'], '%Y-%m-%d')
+            table_data.append([
+                date_obj.strftime('%d/%m/%Y'),
+                receipt['fuel_type'],
+                f"{receipt['liters']:.2f} L",
+                f"{receipt['price_per_liter']:.3f} €",
+                f"{receipt['vat']:.2f} €",
+                f"{receipt['total_price']:.2f} €"
+            ])
+        
+        # Ligne de totaux mensuels
+        table_data.append([
+            'TOTAL MENSUEL',
+            '',
+            f"{data['totals']['liters']:.2f} L",
+            '',
+            f"{data['totals']['vat']:.2f} €",
+            f"{data['totals']['total_price']:.2f} €"
+        ])
+        
+        # Créer le tableau
+        table = Table(table_data, colWidths=[3*cm, 2.5*cm, 2.5*cm, 2.5*cm, 2.5*cm, 2.5*cm])
+        table.setStyle(TableStyle([
+            # En-tête
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1e40af')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, 0), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 10),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            
+            # Corps du tableau
+            ('BACKGROUND', (0, 1), (-1, -2), colors.beige),
+            ('TEXTCOLOR', (0, 1), (-1, -2), colors.black),
+            ('ALIGN', (2, 1), (-1, -1), 'RIGHT'),
+            ('FONTNAME', (0, 1), (-1, -2), 'Helvetica'),
+            ('FONTSIZE', (0, 1), (-1, -2), 9),
+            ('GRID', (0, 0), (-1, -2), 1, colors.grey),
+            
+            # Ligne de total mensuel
+            ('BACKGROUND', (0, -1), (-1, -1), colors.HexColor('#dbeafe')),
+            ('TEXTCOLOR', (0, -1), (-1, -1), colors.HexColor('#1e40af')),
+            ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, -1), (-1, -1), 10),
+            ('ALIGN', (0, -1), (-1, -1), 'RIGHT'),
+            ('LINEABOVE', (0, -1), (-1, -1), 2, colors.HexColor('#1e40af')),
+        ]))
+        
+        elements.append(table)
+        elements.append(Spacer(1, 30))
+    
+    # Résumé global
+    elements.append(PageBreak())
+    elements.append(Paragraph("📊 RÉSUMÉ ANNUEL", title_style))
+    elements.append(Spacer(1, 20))
+    
+    total_tickets = len(receipts)
+    total_liters = sum(r['liters'] for r in receipts)
+    total_vat = sum(r['vat'] for r in receipts)
+    total_price = sum(r['total_price'] for r in receipts)
+    avg_price_per_liter = total_price / total_liters if total_liters > 0 else 0
+    
+    summary_data = [
+        ['Nombre total de tickets', f"{total_tickets}"],
+        ['Total litres', f"{total_liters:.2f} L"],
+        ['Prix moyen au litre', f"{avg_price_per_liter:.3f} €"],
+        ['Total TVA', f"{total_vat:.2f} €"],
+        ['TOTAL GÉNÉRAL', f"{total_price:.2f} €"]
+    ]
+    
+    summary_table = Table(summary_data, colWidths=[10*cm, 6*cm])
+    summary_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, -2), colors.beige),
+        ('BACKGROUND', (0, -1), (-1, -1), colors.HexColor('#1e40af')),
+        ('TEXTCOLOR', (0, 0), (-1, -2), colors.black),
+        ('TEXTCOLOR', (0, -1), (-1, -1), colors.whitesmoke),
+        ('ALIGN', (0, 0), (0, -1), 'LEFT'),
+        ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
+        ('FONTNAME', (0, 0), (-1, -2), 'Helvetica'),
+        ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -2), 12),
+        ('FONTSIZE', (0, -1), (-1, -1), 14),
+        ('GRID', (0, 0), (-1, -1), 1, colors.grey),
+        ('TOPPADDING', (0, 0), (-1, -1), 12),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 12),
+    ]))
+    
+    elements.append(summary_table)
+    
+    # Construire le PDF
+    doc.build(elements)
+    buffer.seek(0)
+    return buffer
+
+async def generate_pdf_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Commande /pdf pour générer un rapport PDF"""
+    await update.message.reply_text("📄 Génération du PDF en cours...")
+    
+    try:
+        receipts = load_receipts()
+        
+        if not receipts:
+            await update.message.reply_text("📭 Aucun ticket enregistré. Ajoutez des tickets d'abord !")
+            return
+        
+        # Récupérer l'année si spécifiée
+        year = None
+        if context.args and len(context.args) > 0:
+            try:
+                year = int(context.args[0])
+            except ValueError:
+                await update.message.reply_text("❌ Format invalide. Utilisez: /pdf ou /pdf 2025")
+                return
+        
+        # Générer le PDF
+        pdf_buffer = generate_pdf(receipts, year)
+        
+        # Nom du fichier
+        if year:
+            filename = f"rapport_carburant_{year}.pdf"
+        else:
+            filename = f"rapport_carburant_complet.pdf"
+        
+        # Envoyer le PDF
+        await update.message.reply_document(
+            document=pdf_buffer,
+            filename=filename,
+            caption=f"✅ Voici votre rapport carburant ! 📊\n\n"
+                   f"Total tickets: {len([r for r in receipts if not year or datetime.strptime(r['date'], '%Y-%m-%d').year == year])}"
+        )
+        
+    except Exception as e:
+        logger.error(f"Erreur génération PDF: {e}")
+        await update.message.reply_text(f"❌ Erreur lors de la génération du PDF: {str(e)}")
+
 async def reset_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Efface toutes les données"""
     try:
@@ -253,6 +478,7 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("total", show_total))
     application.add_handler(CommandHandler("liste", show_list))
+    application.add_handler(CommandHandler("pdf", generate_pdf_command))
     application.add_handler(CommandHandler("reset", reset_data))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     
@@ -265,3 +491,12 @@ def main():
 
 if __name__ == '__main__':
     main()
+```
+
+---
+
+Et pour **requirements.txt** :
+```
+python-telegram-bot==21.0
+anthropic==0.40.0
+reportlab==4.0.9
